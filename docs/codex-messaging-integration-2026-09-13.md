@@ -571,3 +571,14 @@ Use approval boundary is resolved. Performance remains a documented caveat:
 live tails/RSS and matched cold-start evidence are not greened by this run.
 Signing, notarization, and release packaging were intentionally not tested per
 the stated scope; GitHub Actions remains their separate coverage.
+
+### Remote update after this follow-up
+
+- Pushed without force to PR #128's source branch
+  `codex/codex-send-messaging`: `e9c8aab..7738132`.
+- PR #128 remains **OPEN**, non-draft, and **MERGEABLE**.
+- Fresh GitHub Actions `check` for head `7738132` passed in 2m24s. Run:
+  `https://github.com/minchenlee/c9watch/actions/runs/34755561530`.
+- No PR merge was performed. The native Desktop/UI gate remains the only
+  unresolved acceptance item in scope here; performance tails/RSS remain
+  caveats rather than green claims.
