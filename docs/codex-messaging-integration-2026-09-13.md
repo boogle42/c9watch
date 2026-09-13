@@ -505,3 +505,69 @@ remained unchanged. **No push, remote PR update, merge, real-model/approval
 execution, signing or release was performed.** Separate push authorization is
 needed to obtain fresh remote CI; the native limitations and real-provider /
 release gates must remain visible even if that CI passes.
+
+## Current HEAD follow-up: 2026-09-13 live-model and Desktop gate
+
+This section supersedes the stale handoff paragraph above for the current
+checkout. Product implementation was `e9c8aab`; the diagnostic-only follow-up
+is `0d84c0c` (`test(codex): make live bridge model selectable`). No production
+Rust or frontend source changed in that follow-up.
+
+### Current-HEAD checks
+
+- Node feature suite: **39 passed, 0 failed** (`test-codex-composer`,
+  `test-codex-interactions`, and `test-conversation-selection`).
+- Svelte check: **0 errors, 0 warnings**.
+- Rust `codex` filter: **111 passed, 0 failed, 6 ignored**. The ignored live
+  model test remains intentionally opt-in.
+- Current implementation built as an unsigned development bundle from the
+  checkout: `src-tauri/target/debug/bundle/macos/c9watch Messaging Current
+  2026-09-13.app`; executable SHA-256
+  `4c0ffa4f870cfc57bbe166bfd4ac7fdde52c79e70296180fe38c056d79e660dd`.
+- `cargo fmt --check` still reports existing tree-wide formatting drift in the
+  integrated branch. No broad formatting rewrite was made for this gate.
+
+### Real-model bridge result
+
+The account's configured model is `gpt-6-astra`. The former hard-coded
+`gpt-5.4-mini` diagnostic path reached the real Codex app-server but was
+rejected by this ChatGPT account (`model is not supported when using Codex with
+a ChatGPT account`). The diagnostic now accepts `--model`.
+
+Against the current Rust bridge binary, this disposable command used ephemeral,
+read-only threads and no file-writing tools:
+
+```sh
+python3 scripts/experimental/test-desktop-bridge.py \
+  --rust-binary src-tauri/target/debug/c9watch \
+  --live --approval --model gpt-6-astra
+```
+
+Result: **PASS** for fragmented/CRLF framing, isolated server startup and
+cleanup, two real-model messages observed by the original owner, active-turn
+steering in the same turn, owner-only command approval routing, explicit
+approval decline, normal turn completion after decline, and EOF cleanup.
+Diagnostic directory: `/tmp/c9b-4bu9ky0f`.
+
+The optional live image assertion is **NOT PASS**: the same current Rust bridge
+and 16x16 solid-red fixture produced the model answer `blue` once (a direct
+bridge run answered `red` once). This is too unstable to claim image/model
+compatibility and is not counted as a green gate. The earlier native fixture
+image-preview result remains separate no-model evidence.
+
+### Native Desktop UI result
+
+The exact current-HEAD unsigned bundle was not admitted by Computer Use:
+`Computer Use was not approved to use c9watch Messaging Current 2026-09-13`.
+Therefore no current-HEAD native UI evidence exists for composer send,
+answering a question, approving/rejecting a request, Stop, Recheck, or live
+history refresh. The running production ChatGPT/Codex Desktop and unrelated
+tasks were not stopped or relaunched.
+
+**Gate status: OPEN.** The real-model bridge path passes, but that is not a
+Desktop UI acceptance. PR #128 must not be called merge-ready until a disposable
+real Desktop task is exercised on the exact bundle, or this specific Computer
+Use approval boundary is resolved. Performance remains a documented caveat:
+live tails/RSS and matched cold-start evidence are not greened by this run.
+Signing, notarization, and release packaging were intentionally not tested per
+the stated scope; GitHub Actions remains their separate coverage.
