@@ -85,7 +85,7 @@ async def completion(client, thread_id, turn_id, marker):
                 return
 
 
-async def run(live, approval=False, rust_binary=None, kill_bridge=False, image_test=False):
+async def run(live, approval=False, rust_binary=None, kill_bridge=False, image_test=False, model='gpt-5.4-mini'):
     await framing_checks()
     root = Path(tempfile.mkdtemp(prefix='c9b-', dir='/tmp'))
     runtime = root / 'run'
@@ -94,7 +94,7 @@ async def run(live, approval=False, rust_binary=None, kill_bridge=False, image_t
     before = set(endpoints_root.glob('*/ready'))
     command = ([str(Path(rust_binary).resolve()), '--codex-desktop-bridge', '/Applications/ChatGPT.app/Contents/Resources/codex'] if rust_binary else
         [sys.executable, str(HERE / 'codex-desktop-bridge.py'), '--binary', '/Applications/ChatGPT.app/Contents/Resources/codex', '--runtime-dir', str(runtime), '--'])
-    process = await asyncio.create_subprocess_exec(*command, '-c', 'model="gpt-5.4-mini"', 'app-server', '--stdio',
+    process = await asyncio.create_subprocess_exec(*command, '-c', f'model="{model}"', 'app-server', '--stdio',
         cwd=root, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=stderr, limit=bridge.MAX_RECORD + 1)
     clients = []
     child_pid = None
@@ -122,7 +122,7 @@ async def run(live, approval=False, rust_binary=None, kill_bridge=False, image_t
             await asyncio.gather(owner.initialize('c9watch_owner_probe'), sender.initialize('c9watch_sender_probe'))
             # Both clients reuse ID 2; they must receive their own responses.
             config, loaded = await asyncio.gather(owner.call('config/read', {}), sender.call('thread/loaded/list', {}))
-            assert config['config']['model'] == 'gpt-5.4-mini'
+            assert config['config']['model'] == model
             assert loaded['data'] == []
             print('PASS installed Codex: isolated server, inherited config, two client ID spaces, 0700/0600 permissions', flush=True)
             if live:
@@ -205,5 +205,6 @@ async def run(live, approval=False, rust_binary=None, kill_bridge=False, image_t
 
 
 if __name__ == '__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--live',action='store_true');parser.add_argument('--approval',action='store_true');parser.add_argument('--rust-binary');parser.add_argument('--kill-bridge',action='store_true');parser.add_argument('--image',action='store_true')
-    asyncio.run(run(parser.parse_args().live, parser.parse_args().approval, parser.parse_args().rust_binary, parser.parse_args().kill_bridge, parser.parse_args().image))
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--live',action='store_true');parser.add_argument('--approval',action='store_true');parser.add_argument('--rust-binary');parser.add_argument('--kill-bridge',action='store_true');parser.add_argument('--image',action='store_true');parser.add_argument('--model',default='gpt-5.4-mini')
+    args = parser.parse_args()
+    asyncio.run(run(args.live, args.approval, args.rust_binary, args.kill_bridge, args.image, args.model))
