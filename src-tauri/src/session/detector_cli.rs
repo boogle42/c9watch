@@ -1,9 +1,11 @@
 use super::detector::encode_path_for_matching;
+use super::pid_is_alive;
 use super::source::{
     CliActivity, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
     SessionSource,
 };
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -150,8 +152,15 @@ impl SessionSource for CliSessionSource {
             )));
         }
 
-        let agents: Vec<CliAgent> =
-            serde_json::from_slice(&buf).map_err(|e| SessionDetectorError::Parse(e.to_string()))?;
+        let agents = parse_cli_agents(&buf)?;
+
+        // `claude agents --json` is a registry Claude Code writes and prunes itself;
+        // pruning runs in the agent's own exit path, so a hard kill (an external
+        // SIGKILL, or a process wedged in an uninterruptible syscall no signal can
+        // interrupt) can leave a stale entry pointing at a pid that no longer exists,
+        // reported as busy/idle/waiting like any live agent. Drop those before they
+        // ever reach status inference.
+        let agents = filter_live_agents(agents, pid_is_alive);
 
         // Filter out non-CLI entrypoints (e.g. sdk-ts from Zed/IDE integrations).
         // `claude agents --json` lists every live agent including SDK-driven ones,
@@ -175,6 +184,58 @@ impl SessionSource for CliSessionSource {
     fn backend_name(&self) -> &'static str {
         "cli"
     }
+}
+
+/// Drops any agent whose reported pid is no longer an actual running process.
+/// Takes the liveness check as a parameter so tests can fake it without
+/// spawning/killing real processes.
+fn filter_live_agents(agents: Vec<CliAgent>, is_alive: impl Fn(u32) -> bool) -> Vec<CliAgent> {
+    agents.into_iter().filter(|a| is_alive(a.pid)).collect()
+}
+
+/// Parse the Claude agent registry without allowing one known stopped
+/// background entry to discard healthy live rows.
+///
+/// Claude Code can retain an observed background job row after its process has
+/// gone away. The known contract from issue130 is `kind: "background"`,
+/// `state: "blocked"`, and no usable `pid`; that row is not a session c9watch
+/// can monitor or control, so it is omitted. The predicate is intentionally
+/// narrow: other missing/invalid required fields remain parse errors rather
+/// than silently accepting an unknown schema change.
+fn parse_cli_agents(buf: &[u8]) -> Result<Vec<CliAgent>, SessionDetectorError> {
+    let rows: Vec<Value> =
+        serde_json::from_slice(buf).map_err(|e| SessionDetectorError::Parse(e.to_string()))?;
+    let mut agents = Vec::with_capacity(rows.len());
+
+    for (index, row) in rows.into_iter().enumerate() {
+        let Some(object) = row.as_object() else {
+            return Err(SessionDetectorError::Parse(format!(
+                "agent row {index} is not an object"
+            )));
+        };
+
+        match object.get("pid") {
+            None | Some(Value::Null) if is_known_blocked_background(object) => continue,
+            None | Some(Value::Null) => {
+                return Err(SessionDetectorError::Parse(format!(
+                    "agent row {index} is missing pid"
+                )));
+            }
+            Some(_) => {}
+        }
+
+        let agent = serde_json::from_value::<CliAgent>(row)
+            .map_err(|error| SessionDetectorError::Parse(format!("agent row {index}: {error}")))?;
+        agents.push(agent);
+    }
+
+    Ok(agents)
+}
+
+fn is_known_blocked_background(object: &Map<String, Value>) -> bool {
+    let is_background = object.get("kind").and_then(Value::as_str) == Some("background");
+    let state = object.get("state").and_then(Value::as_str);
+    is_background && state == Some("blocked")
 }
 
 /// `entrypoint` values known to be third-party SDK integrations (Zed/IDE)
@@ -277,7 +338,7 @@ mod tests {
 
     #[test]
     fn parse_cli_output_full_schema() {
-        let agents: Vec<CliAgent> = serde_json::from_str(full_schema_json()).unwrap();
+        let agents = parse_cli_agents(full_schema_json().as_bytes()).unwrap();
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].pid, 1);
         assert_eq!(agents[0].session_id, "sid-a");
@@ -285,9 +346,28 @@ mod tests {
     }
 
     #[test]
+    fn map_agent_to_session_preserves_entrypoint() {
+        let mut source = CliSessionSource::new();
+        let session = source.map_agent_to_session(
+            CliAgent {
+                pid: std::process::id(),
+                cwd: PathBuf::from("/tmp/entrypoint-fixture"),
+                kind: "interactive".to_string(),
+                started_at: 1,
+                session_id: "entrypoint-session".to_string(),
+                name: None,
+                status: None,
+            },
+            Some("sdk-cli".to_string()),
+        );
+
+        assert_eq!(session.entrypoint.as_deref(), Some("sdk-cli"));
+    }
+
+    #[test]
     fn parse_cli_output_missing_status_yields_none_in_mapping() {
         let json = r#"[{"pid":1,"cwd":"/tmp","kind":"interactive","startedAt":1,"sessionId":"x"}]"#;
-        let agents: Vec<CliAgent> = serde_json::from_str(json).unwrap();
+        let agents = parse_cli_agents(json.as_bytes()).unwrap();
         assert!(agents[0].status.is_none());
         let mapped_activity = match agents[0].status.as_deref() {
             Some("busy") => Some(CliActivity::Busy),
@@ -300,7 +380,7 @@ mod tests {
     #[test]
     fn parse_cli_output_busy_yields_some_busy() {
         let json = r#"[{"pid":1,"cwd":"/tmp","kind":"interactive","startedAt":1,"sessionId":"x","status":"busy"}]"#;
-        let agents: Vec<CliAgent> = serde_json::from_str(json).unwrap();
+        let agents = parse_cli_agents(json.as_bytes()).unwrap();
         let mapped = match agents[0].status.as_deref() {
             Some("busy") => Some(CliActivity::Busy),
             Some("idle") => Some(CliActivity::Idle),
@@ -312,7 +392,7 @@ mod tests {
     #[test]
     fn parse_cli_output_unknown_status_yields_none() {
         let json = r#"[{"pid":1,"cwd":"/tmp","kind":"interactive","startedAt":1,"sessionId":"x","status":"on_fire"}]"#;
-        let agents: Vec<CliAgent> = serde_json::from_str(json).unwrap();
+        let agents = parse_cli_agents(json.as_bytes()).unwrap();
         let mapped = match agents[0].status.as_deref() {
             Some("busy") => Some(CliActivity::Busy),
             Some("idle") => Some(CliActivity::Idle),
@@ -324,7 +404,7 @@ mod tests {
     #[test]
     fn parse_cli_output_unknown_kind_yields_unknown() {
         let json = r#"[{"pid":1,"cwd":"/tmp","kind":"chimera","startedAt":1,"sessionId":"x"}]"#;
-        let agents: Vec<CliAgent> = serde_json::from_str(json).unwrap();
+        let agents = parse_cli_agents(json.as_bytes()).unwrap();
         let mapped_kind = match agents[0].kind.as_str() {
             "interactive" => SessionKind::Interactive,
             "background" => SessionKind::Background,
@@ -337,14 +417,65 @@ mod tests {
     fn parse_cli_output_missing_kind_defaults_to_interactive() {
         // CC 2.1.145–146 emit `claude agents --json` without the `kind` field.
         let json = r#"[{"pid":1,"cwd":"/tmp","startedAt":1,"sessionId":"x"}]"#;
-        let agents: Vec<CliAgent> = serde_json::from_str(json).unwrap();
+        let agents = parse_cli_agents(json.as_bytes()).unwrap();
         assert_eq!(agents[0].kind, "interactive");
     }
 
     #[test]
+    fn filter_live_agents_drops_dead_pids() {
+        let agents = parse_cli_agents(full_schema_json().as_bytes()).unwrap();
+        assert_eq!(agents.len(), 2);
+        // sid-a's pid (1) reported alive, sid-b's pid (2) reported dead.
+        let filtered = filter_live_agents(agents, |pid| pid == 1);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_id, "sid-a");
+    }
+
+    #[test]
+    fn filter_live_agents_keeps_all_when_all_alive() {
+        let agents = parse_cli_agents(full_schema_json().as_bytes()).unwrap();
+        let filtered = filter_live_agents(agents, |_| true);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn filter_live_agents_drops_all_when_none_alive() {
+        let agents = parse_cli_agents(full_schema_json().as_bytes()).unwrap();
+        let filtered = filter_live_agents(agents, |_| false);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
     fn parse_cli_output_empty_array() {
-        let agents: Vec<CliAgent> = serde_json::from_str("[]").unwrap();
+        let agents = parse_cli_agents(b"[]").unwrap();
         assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn parse_cli_output_skips_known_blocked_background_and_keeps_live_rows() {
+        let json = r#"[
+          {"id":"stopped","cwd":"/tmp/stopped","kind":"background","startedAt":1,"sessionId":"stopped","state":"blocked"},
+          {"pid":7,"cwd":"/tmp/live","kind":"interactive","startedAt":2,"sessionId":"live","status":"idle"}
+        ]"#;
+        let agents = parse_cli_agents(json.as_bytes()).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].pid, 7);
+        assert_eq!(agents[0].session_id, "live");
+    }
+
+    #[test]
+    fn parse_cli_output_missing_pid_on_unknown_shape_is_an_error() {
+        let json =
+            r#"[{"cwd":"/tmp/unknown","kind":"interactive","startedAt":1,"sessionId":"unknown"}]"#;
+        let error = parse_cli_agents(json.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("agent row 0 is missing pid"));
+    }
+
+    #[test]
+    fn parse_cli_output_invalid_live_row_is_an_error() {
+        let json = r#"[{"pid":"not-a-number","cwd":"/tmp/live","kind":"interactive","startedAt":1,"sessionId":"live"}]"#;
+        let error = parse_cli_agents(json.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("agent row 0"));
     }
 
     #[test]
