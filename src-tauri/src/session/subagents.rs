@@ -9,12 +9,20 @@
 //! `tool_result` has appeared yet — that's how we detect "running" subagents
 //! without requiring users to install a hook.
 
-use crate::session::parser::{parse_all_entries, MessageContent, SessionEntry};
+use crate::session::cache::{
+    can_incrementally_read, extend_prefix_snapshot, hash_file_prefix, next_full_verify_offset,
+    read_lines_from_offset, validate_cached_prefix, FileVersion, PrefixSnapshot,
+    PrefixValidationKind,
+};
+use crate::session::parser::{parse_jsonl_entries, MessageContent, SessionEntry};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 // JSONL entry type constants
 const ENTRY_TYPE_TOOL_USE: &str = "tool_use";
@@ -134,18 +142,14 @@ fn extract_subagents_from_entries(
 /// Second pass: scan raw JSONL lines for tool_result blocks inside user
 /// messages. The typed parser collapses these into a single content string and
 /// drops the `tool_use_id`, so we re-scan the raw JSON for the IDs.
-fn collect_user_tool_result_ids<P: AsRef<Path>>(path: P) -> HashMap<String, String> {
+///
+/// Takes already-read lines (rather than a path) so callers that already have
+/// the raw lines in hand — the full parse and the incremental cache below —
+/// don't pay for a second file read of the same bytes.
+fn collect_user_tool_result_ids_from_lines(lines: &[String]) -> HashMap<String, String> {
     let mut completed: HashMap<String, String> = HashMap::new();
-    let Ok(file) = fs::File::open(path.as_ref()) else {
-        return completed;
-    };
-    use std::io::{BufRead, BufReader};
-    let reader = BufReader::new(file);
-    for line in reader.lines().map_while(Result::ok) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
@@ -177,22 +181,12 @@ fn collect_user_tool_result_ids<P: AsRef<Path>>(path: P) -> HashMap<String, Stri
     completed
 }
 
-/// Returns subagent invocations for the given session JSONL path.
-///
-/// `session_id` is the parent session's UUID (used to populate `parent_session_id`).
-pub fn active_subagents_for_path<P: AsRef<Path>>(
-    session_id: &str,
-    jsonl_path: P,
-) -> Vec<SubagentInfo> {
-    let path = jsonl_path.as_ref();
-    let entries = match parse_all_entries(path) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
+/// Builds subagent info from a full (or full-so-far) set of raw JSONL lines.
+fn build_subagents_from_lines(session_id: &str, lines: &[String]) -> Vec<SubagentInfo> {
+    let user_results = collect_user_tool_result_ids_from_lines(lines);
+    let entries = parse_jsonl_entries(lines.to_vec());
     let mut subagents = extract_subagents_from_entries(&entries, session_id);
 
-    // Merge in tool_result IDs found in user-role messages.
-    let user_results = collect_user_tool_result_ids(path);
     for sa in subagents.iter_mut() {
         if sa.completed_at.is_none() {
             if let Some(ts) = user_results.get(&sa.id) {
@@ -202,6 +196,305 @@ pub fn active_subagents_for_path<P: AsRef<Path>>(
         }
     }
 
+    subagents
+}
+
+/// Folds newly-appended lines into an already-known subagent list: updates
+/// any existing `Running` entry that just completed, and appends any brand
+/// new Agent/Task invocations found in the new lines. Mirrors
+/// `build_subagents_from_lines`'s completion rules, but only over the delta.
+fn merge_new_subagents(
+    existing: &mut Vec<SubagentInfo>,
+    new_entries: &[SessionEntry],
+    new_lines: &[String],
+    parent_session_id: &str,
+) {
+    let mut newly_completed: HashMap<String, String> = HashMap::new();
+    for entry in new_entries {
+        if let SessionEntry::Assistant { base, message } = entry {
+            for content in &message.content {
+                if let MessageContent::ToolResult { tool_use_id, .. } = content {
+                    newly_completed
+                        .entry(tool_use_id.clone())
+                        .or_insert(base.timestamp.clone());
+                }
+            }
+        }
+    }
+    for (id, ts) in collect_user_tool_result_ids_from_lines(new_lines) {
+        newly_completed.entry(id).or_insert(ts);
+    }
+
+    for sa in existing.iter_mut() {
+        if sa.status == SubagentStatus::Running {
+            if let Some(ts) = newly_completed.get(&sa.id) {
+                sa.completed_at = Some(ts.clone());
+                sa.status = SubagentStatus::Completed;
+            }
+        }
+    }
+
+    let existing_ids: HashSet<String> = existing.iter().map(|s| s.id.clone()).collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    for entry in new_entries {
+        if let SessionEntry::Assistant { base, message } = entry {
+            for content in &message.content {
+                if let MessageContent::ToolUse { id, name, input } = content {
+                    if !SUBAGENT_TOOL_NAMES.contains(&name.as_str()) {
+                        continue;
+                    }
+                    if existing_ids.contains(id) || !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let agent_type = input
+                        .get("subagent_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("subagent")
+                        .to_string();
+                    let description = input
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let completed_at = newly_completed.get(id).cloned();
+                    let status = if completed_at.is_some() {
+                        SubagentStatus::Completed
+                    } else {
+                        SubagentStatus::Running
+                    };
+                    existing.push(SubagentInfo {
+                        id: id.clone(),
+                        agent_type,
+                        description,
+                        started_at: base.timestamp.clone(),
+                        completed_at,
+                        parent_session_id: parent_session_id.to_string(),
+                        status,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Returns subagent invocations for the given session JSONL path.
+///
+/// `session_id` is the parent session's UUID (used to populate `parent_session_id`).
+pub fn active_subagents_for_path<P: AsRef<Path>>(
+    session_id: &str,
+    jsonl_path: P,
+) -> Vec<SubagentInfo> {
+    let path = jsonl_path.as_ref();
+    let Ok((lines, _offset)) = read_lines_from_offset(path, 0) else {
+        return Vec::new();
+    };
+    build_subagents_from_lines(session_id, &lines)
+}
+
+/// Cached subagent state for one file: the version stamp and byte offset the
+/// cache is current as of, plus the accumulated subagent list as of that
+/// offset.
+struct SubagentCacheEntry {
+    stamp: FileVersion,
+    offset: u64,
+    subagents: Vec<SubagentInfo>,
+    prefix: Option<PrefixSnapshot>,
+    next_full_verify_offset: u64,
+    last_full_validation_at: Instant,
+    #[cfg(test)]
+    last_prefix_validation_bytes: u64,
+    last_access: Instant,
+}
+
+/// Caches `active_subagents_for_path` results per file, so neither an
+/// unchanged transcript nor the already-scanned prefix of a growing one gets
+/// re-read and re-parsed on every poll. `all_subagents_by_session` walks
+/// every session file under `~/.claude/projects/` on each call; without an
+/// unchanged-file cache, that cost scales with a user's entire lifetime
+/// history rather than active session count. And an actively-written session
+/// (a real running subagent) changes on every poll by definition, so the
+/// unchanged-file cache alone can't help it — incremental resumption below
+/// is what keeps that case cheap too, instead of re-parsing the whole
+/// transcript from byte zero every ~3.5s for as long as the session runs.
+static SUBAGENT_CACHE: LazyLock<Mutex<HashMap<PathBuf, SubagentCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Bound path-level cache growth. Per-file subagent vectors are still kept for
+/// live sessions so append deltas can be folded cheaply; stale/non-live paths
+/// are pruned after each directory walk below.
+const SUBAGENT_CACHE_MAX_ENTRIES: usize = 512;
+
+fn evict_oldest_subagent_cache_entries(cache: &mut HashMap<PathBuf, SubagentCacheEntry>) {
+    while cache.len() > SUBAGENT_CACHE_MAX_ENTRIES {
+        let Some(oldest_path) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(path, _)| path.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_path);
+    }
+}
+
+/// Same as `active_subagents_for_path`, but backed by `SUBAGENT_CACHE`.
+/// Small prefixes are fully verified; large prefixes use fixed head/tail
+/// guards between geometric checkpoints and a 60-second full-revalidation
+/// deadline. The deadline is checked on lookup, not in the background, so a
+/// large middle rewrite has a bounded consistency delay without making every
+/// poll reparse the whole transcript.
+fn cached_active_subagents_for_path(session_id: &str, path: &Path) -> Vec<SubagentInfo> {
+    cached_active_subagents_for_path_at(session_id, path, Instant::now())
+}
+
+fn cached_active_subagents_for_path_at(
+    session_id: &str,
+    path: &Path,
+    now: Instant,
+) -> Vec<SubagentInfo> {
+    let Ok(stamp) = FileVersion::read(path) else {
+        if let Ok(mut cache) = SUBAGENT_CACHE.lock() {
+            cache.remove(path);
+        }
+        return Vec::new();
+    };
+
+    let mut cache = match SUBAGENT_CACHE.lock() {
+        Ok(cache) => cache,
+        Err(_) => return active_subagents_for_path(session_id, path),
+    };
+
+    if let Some((
+        previous_stamp,
+        previous_offset,
+        previous_subagents,
+        previous_prefix,
+        previous_next_full_verify_offset,
+        previous_last_full_validation_at,
+    )) = cache.get(path).map(|existing| {
+        (
+            existing.stamp,
+            existing.offset,
+            existing.subagents.clone(),
+            existing.prefix,
+            existing.next_full_verify_offset,
+            existing.last_full_validation_at,
+        )
+    }) {
+        if let Some(previous_prefix) = previous_prefix {
+            if previous_stamp == stamp && stamp.supports_unchanged_fast_path() {
+                if now.saturating_duration_since(previous_last_full_validation_at)
+                    < crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
+                {
+                    if let Some(existing) = cache.get_mut(path) {
+                        existing.last_access = now;
+                    }
+                    return previous_subagents;
+                }
+
+                if let Some(validation) = validate_cached_prefix(
+                    path,
+                    previous_prefix,
+                    previous_next_full_verify_offset,
+                    previous_last_full_validation_at,
+                    now,
+                ) {
+                    if let Some(existing) = cache.get_mut(path) {
+                        existing.prefix = Some(validation.snapshot);
+                        if validation.kind == PrefixValidationKind::Full {
+                            existing.last_full_validation_at = now;
+                            existing.next_full_verify_offset =
+                                next_full_verify_offset(existing.offset);
+                        }
+                        #[cfg(test)]
+                        {
+                            existing.last_prefix_validation_bytes = validation.bytes_read;
+                        }
+                        existing.last_access = now;
+                    }
+                    return previous_subagents;
+                }
+            }
+
+            if can_incrementally_read(previous_stamp, stamp) {
+                if let Some(validation) = validate_cached_prefix(
+                    path,
+                    previous_prefix,
+                    previous_next_full_verify_offset,
+                    previous_last_full_validation_at,
+                    now,
+                ) {
+                    if let Ok((new_lines, new_offset)) =
+                        read_lines_from_offset(path, previous_offset)
+                    {
+                        if let Ok(prefix) = extend_prefix_snapshot(
+                            path,
+                            previous_offset,
+                            new_offset,
+                            validation.snapshot,
+                        ) {
+                            let mut subagents = previous_subagents;
+                            if !new_lines.is_empty() {
+                                let new_entries = parse_jsonl_entries(new_lines.clone());
+                                merge_new_subagents(
+                                    &mut subagents,
+                                    &new_entries,
+                                    &new_lines,
+                                    session_id,
+                                );
+                            }
+                            let full_validation = validation.kind == PrefixValidationKind::Full;
+                            cache.insert(
+                                path.to_path_buf(),
+                                SubagentCacheEntry {
+                                    stamp,
+                                    offset: new_offset,
+                                    subagents: subagents.clone(),
+                                    prefix: Some(prefix),
+                                    next_full_verify_offset: if full_validation {
+                                        next_full_verify_offset(new_offset)
+                                    } else {
+                                        previous_next_full_verify_offset
+                                    },
+                                    last_full_validation_at: if full_validation {
+                                        now
+                                    } else {
+                                        previous_last_full_validation_at
+                                    },
+                                    #[cfg(test)]
+                                    last_prefix_validation_bytes: validation.bytes_read,
+                                    last_access: now,
+                                },
+                            );
+                            evict_oldest_subagent_cache_entries(&mut cache);
+                            return subagents;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let Ok((lines, offset)) = read_lines_from_offset(path, 0) else {
+        cache.remove(path);
+        return Vec::new();
+    };
+    let subagents = build_subagents_from_lines(session_id, &lines);
+    cache.insert(
+        path.to_path_buf(),
+        SubagentCacheEntry {
+            stamp,
+            offset,
+            subagents: subagents.clone(),
+            prefix: hash_file_prefix(path, offset).ok(),
+            next_full_verify_offset: next_full_verify_offset(offset),
+            last_full_validation_at: now,
+            #[cfg(test)]
+            last_prefix_validation_bytes: 0,
+            last_access: now,
+        },
+    );
+    evict_oldest_subagent_cache_entries(&mut cache);
     subagents
 }
 
@@ -658,9 +951,99 @@ pub fn get_subagent_transcript(
     None
 }
 
+/// How long a completed subagent stays relevant after finishing. Mirrors the
+/// frontend's own `COMPLETED_RETENTION_MS` (`src/lib/stores/subagents.ts`),
+/// which discards anything older on receipt anyway — filtering here means
+/// the backend doesn't build and JSON-serialize an entry, over IPC, on every
+/// poll, for every subagent a session has EVER run. A session can easily
+/// carry decades of history-old completed subagents that are otherwise never
+/// dropped from `all_subagents_by_session`'s output.
+const COMPLETED_RETENTION_SECONDS: i64 = 60;
+
+/// True for a running subagent, or one that completed within the retention
+/// window. An unparseable `completed_at` is treated as expired (not
+/// relevant), matching both `status.rs`'s `is_entry_recent` convention and
+/// the frontend's actual behavior (`new Date(bad).getTime()` is `NaN`, and
+/// any comparison against `NaN` is `false`).
+fn is_relevant(sa: &SubagentInfo, now: DateTime<Utc>) -> bool {
+    match sa.status {
+        SubagentStatus::Running => true,
+        SubagentStatus::Completed => match sa.completed_at.as_deref() {
+            Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+                Ok(completed) => {
+                    now.signed_duration_since(completed.with_timezone(&Utc)).num_seconds()
+                        < COMPLETED_RETENTION_SECONDS
+                }
+                Err(_) => false,
+            },
+            None => false,
+        },
+    }
+}
+
+/// True if this path's last-cached subagent snapshot still has an entry worth
+/// checking when the parent is not currently live. Running entries are only
+/// retained while their parent is live; otherwise a crashed/stopped parent
+/// could remain visible forever just because its last transcript row lacked a
+/// completion result. Recently completed entries remain eligible for the
+/// frontend retention window after the parent disappears.
+fn cache_has_relevant_entry(path: &Path, now: DateTime<Utc>, parent_is_live: bool) -> bool {
+    let Ok(cache) = SUBAGENT_CACHE.lock() else {
+        return false;
+    };
+    cache
+        .get(path)
+        .is_some_and(|entry| {
+            entry.subagents.iter().any(|sa| {
+                is_relevant(sa, now)
+                    && (parent_is_live || sa.status == SubagentStatus::Completed)
+            })
+        })
+}
+
+/// Remove cache entries that can no longer affect the next response. A live
+/// parent keeps its snapshot so a future append can be read incrementally;
+/// non-live parents keep only recently completed rows for the explicit UI
+/// retention window. Missing paths are removed as well. This is a bounded
+/// retention policy, not a correctness shortcut for file invalidation.
+fn prune_subagent_cache(
+    cache: &mut HashMap<PathBuf, SubagentCacheEntry>,
+    seen_paths: &HashSet<PathBuf>,
+    live_session_ids: &HashSet<String>,
+    now: DateTime<Utc>,
+) {
+    cache.retain(|path, entry| {
+        if !seen_paths.contains(path) {
+            return false;
+        }
+        let parent_is_live = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| live_session_ids.contains(stem));
+        parent_is_live
+            || entry.subagents.iter().any(|sa| {
+                sa.status == SubagentStatus::Completed && is_relevant(sa, now)
+            })
+    });
+    evict_oldest_subagent_cache_entries(cache);
+}
+
 /// Build a map of provider-scoped parent identity -> subagents for all Claude
 /// sessions found under `~/.claude/projects/`. Caller filters/joins as needed.
-pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
+///
+/// `live_session_ids` is the caller's already-known set of currently-live
+/// Claude Code session ids (the frontend has this on hand from its own
+/// `sessions` store on every call, since a subagent refresh is triggered by
+/// that store changing) — used only to decide which files are worth a
+/// stat/cache-lookup at all. Deriving this set independently in here would
+/// mean spawning a second `claude agents --json` per poll on top of the one
+/// the main session-polling loop already does.
+///
+/// Only running subagents, and completed ones still within the retention
+/// window, are included — see `is_relevant`.
+pub fn all_subagents_by_session(
+    live_session_ids: &HashSet<String>,
+) -> HashMap<String, Vec<SubagentInfo>> {
     let mut out: HashMap<String, Vec<SubagentInfo>> = HashMap::new();
     let Some(home) = dirs::home_dir() else {
         return out;
@@ -669,6 +1052,8 @@ pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
     let Ok(project_iter) = fs::read_dir(&projects_dir) else {
         return out;
     };
+    let now = Utc::now();
+    let mut seen_paths = HashSet::new();
     for project_entry in project_iter.flatten() {
         let project_path = project_entry.path();
         if !project_path.is_dir() {
@@ -682,14 +1067,32 @@ pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
+            seen_paths.insert(path.clone());
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let subs = active_subagents_for_path(stem, &path);
+
+            // Skip the stat/cache-lookup entirely for a session that's
+            // neither currently live nor already known to have something
+            // relevant — this is what keeps the cost of this function
+            // bounded by active session count instead of a user's entire
+            // lifetime history of session files.
+            let parent_is_live = live_session_ids.contains(stem);
+            if !parent_is_live && !cache_has_relevant_entry(&path, now, false) {
+                continue;
+            }
+
+            let subs: Vec<SubagentInfo> = cached_active_subagents_for_path(stem, &path)
+                .into_iter()
+                .filter(|sa| is_relevant(sa, now))
+                .collect();
             if !subs.is_empty() {
                 out.insert(format!("claudeCode:{stem}"), subs);
             }
         }
+    }
+    if let Ok(mut cache) = SUBAGENT_CACHE.lock() {
+        prune_subagent_cache(&mut cache, &seen_paths, live_session_ids, now);
     }
     out
 }
@@ -698,6 +1101,7 @@ pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::NamedTempFile;
 
     fn write_jsonl(lines: &[&str]) -> NamedTempFile {
@@ -766,6 +1170,457 @@ mod tests {
         let by_id: HashMap<&str, &SubagentInfo> = subs.iter().map(|s| (s.id.as_str(), s)).collect();
         assert_eq!(by_id["a1"].status, SubagentStatus::Completed);
         assert_eq!(by_id["a2"].status, SubagentStatus::Running);
+    }
+
+    fn subagent_info(status: SubagentStatus, completed_at: Option<&str>) -> SubagentInfo {
+        SubagentInfo {
+            id: "a1".to_string(),
+            agent_type: "x".to_string(),
+            description: "d".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            completed_at: completed_at.map(str::to_string),
+            parent_session_id: "s1".to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn is_relevant_running_is_always_relevant_regardless_of_age() {
+        let sa = subagent_info(SubagentStatus::Running, None);
+        assert!(is_relevant(&sa, Utc::now()));
+    }
+
+    #[test]
+    fn is_relevant_recently_completed_is_relevant() {
+        let now = Utc::now();
+        let completed_at = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let sa = subagent_info(SubagentStatus::Completed, Some(&completed_at));
+        assert!(is_relevant(&sa, now));
+    }
+
+    #[test]
+    fn is_relevant_old_completion_is_not_relevant() {
+        let now = Utc::now();
+        let completed_at = (now - chrono::Duration::seconds(300)).to_rfc3339();
+        let sa = subagent_info(SubagentStatus::Completed, Some(&completed_at));
+        assert!(!is_relevant(&sa, now));
+    }
+
+    #[test]
+    fn is_relevant_completed_with_no_timestamp_is_not_relevant() {
+        let sa = subagent_info(SubagentStatus::Completed, None);
+        assert!(!is_relevant(&sa, Utc::now()));
+    }
+
+    #[test]
+    fn is_relevant_completed_with_unparseable_timestamp_is_not_relevant() {
+        let sa = subagent_info(SubagentStatus::Completed, Some("not-a-timestamp"));
+        assert!(!is_relevant(&sa, Utc::now()));
+    }
+
+    #[test]
+    fn cache_has_relevant_entry_requires_live_parent_for_running_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("relevance-check.jsonl");
+        let now = Utc::now();
+
+        // Never scanned -- nothing cached, not relevant.
+        assert!(!cache_has_relevant_entry(&path, now, false));
+
+        // A running subagent populates the cache via the real lookup path.
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#),
+        )
+        .unwrap();
+        let _ = cached_active_subagents_for_path("s1", &path);
+        assert!(!cache_has_relevant_entry(&path, now, false));
+        assert!(cache_has_relevant_entry(&path, now, true));
+    }
+
+    #[test]
+    fn cached_lookup_reuses_result_until_file_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("synthetic-cache.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_cache","name":"Agent","input":{"subagent_type":"x","description":"d"}}],"stop_reason":null,"stop_sequence":null}}"#),
+        )
+        .unwrap();
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].status, SubagentStatus::Running);
+
+        // Second lookup with no file change should return the cached result.
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].status, SubagentStatus::Running);
+
+        // Appending a completing tool_result changes the file's version
+        // stamp, so the next lookup must re-parse rather than serve stale
+        // cached data.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:01:00Z","sessionId":"s1","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_cache","content":"done"}}]}}}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].status, SubagentStatus::Completed);
+    }
+
+    #[test]
+    fn cached_lookup_unchanged_fast_path_skips_validation_until_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("unchanged-budget.jsonl");
+        let line = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"budget-agent","name":"Agent","input":{"subagent_type":"x","description":"budget"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        assert!(FileVersion::read(&path)
+            .unwrap()
+            .supports_unchanged_fast_path());
+
+        let t0 = Instant::now();
+        assert_eq!(cached_active_subagents_for_path_at("s1", &path, t0).len(), 1);
+        assert_eq!(
+            SUBAGENT_CACHE
+                .lock()
+                .unwrap()
+                .get(&path)
+                .unwrap()
+                .last_prefix_validation_bytes,
+            0
+        );
+
+        // An unchanged strong stamp before the deadline must not hash even a
+        // small exact-prefix file on the production cache path.
+        assert_eq!(
+            cached_active_subagents_for_path_at("s1", &path, t0 + Duration::from_secs(1)).len(),
+            1
+        );
+        assert_eq!(
+            SUBAGENT_CACHE
+                .lock()
+                .unwrap()
+                .get(&path)
+                .unwrap()
+                .last_prefix_validation_bytes,
+            0
+        );
+
+        // At the deadline the unchanged file is fully verified.
+        assert_eq!(
+            cached_active_subagents_for_path_at(
+                "s1",
+                &path,
+                t0 + crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
+                    + Duration::from_secs(1),
+            )
+            .len(),
+            1
+        );
+        let cache = SUBAGENT_CACHE.lock().unwrap();
+        let entry = cache.get(&path).unwrap();
+        assert_eq!(
+            entry.last_prefix_validation_bytes,
+            entry.offset * 2,
+            "deadline must perform a full small-prefix validation"
+        );
+    }
+
+    #[test]
+    fn cached_lookup_handles_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.jsonl");
+        assert!(cached_active_subagents_for_path("s1", &path).is_empty());
+    }
+
+    #[test]
+    fn cached_lookup_incremental_append_adds_new_subagent_and_completes_old_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("incremental.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#),
+        )
+        .unwrap();
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].status, SubagentStatus::Running);
+
+        // Append: complete a1, AND launch a brand-new second subagent, in one
+        // batch of new bytes — exercises both merge paths at once.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:01:00Z","sessionId":"s1","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"a1","content":"done"}}]}}}}"#
+        ).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","uuid":"u3","timestamp":"2026-01-01T00:02:00Z","sessionId":"s1","message":{{"id":"m2","role":"assistant","model":"claude","content":[{{"type":"tool_use","id":"a2","name":"Agent","input":{{"subagent_type":"y","description":"two"}}}}],"stop_reason":null,"stop_sequence":null}}}}"#
+        ).unwrap();
+        drop(file);
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        let by_id: HashMap<&str, &SubagentInfo> = subs.iter().map(|s| (s.id.as_str(), s)).collect();
+        assert_eq!(subs.len(), 2);
+        assert_eq!(by_id["a1"].status, SubagentStatus::Completed);
+        assert_eq!(by_id["a2"].status, SubagentStatus::Running);
+
+        // A second, independent incremental step on top of the first must
+        // still work: complete a2 without disturbing a1.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","uuid":"u4","timestamp":"2026-01-01T00:03:00Z","sessionId":"s1","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"a2","content":"done too"}}]}}}}"#
+        ).unwrap();
+        drop(file);
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        let by_id: HashMap<&str, &SubagentInfo> = subs.iter().map(|s| (s.id.as_str(), s)).collect();
+        assert_eq!(subs.len(), 2);
+        assert_eq!(by_id["a1"].status, SubagentStatus::Completed);
+        assert_eq!(by_id["a2"].status, SubagentStatus::Completed);
+    }
+
+    #[test]
+    fn cached_lookup_reparses_same_inode_equal_length_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("same-length-rewrite.jsonl");
+        let first = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let replacement = first.replace("a1", "b1");
+        assert_eq!(first.len(), replacement.len());
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        let before = FileVersion::read(&path).unwrap();
+        assert_eq!(cached_active_subagents_for_path("s1", &path)[0].id, "a1");
+
+        std::fs::write(&path, format!("{replacement}\n")).unwrap();
+        let after = FileVersion::read(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id, "b1");
+    }
+
+    #[test]
+    fn cached_lookup_large_middle_rewrite_revalidates_after_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("large-middle-rewrite.jsonl");
+        let filler = format!(r#"{{"type":"system","padding":"{}"}}"#, "x".repeat(1024));
+        let filler_line = format!("{filler}\n");
+        let middle_old = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"agent-old","name":"Agent","input":{"subagent_type":"x","description":"middle"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let middle_new = middle_old.replace("agent-old", "agent-new");
+        assert_eq!(middle_old.len(), middle_new.len());
+
+        let mut original = String::new();
+        while original.len() < 2 * 1024 * 1024 {
+            original.push_str(&filler_line);
+        }
+        let middle_offset = original.len();
+        original.push_str(&middle_old);
+        original.push('\n');
+        while original.len()
+            < crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT as usize + 256 * 1024
+        {
+            original.push_str(&filler_line);
+        }
+        std::fs::write(&path, &original).unwrap();
+        let before = FileVersion::read(&path).unwrap();
+        assert!(before.len > crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT);
+
+        let t0 = Instant::now();
+        let initial = cached_active_subagents_for_path_at("s1", &path, t0);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].id, "agent-old");
+
+        let mut rewritten = original.clone();
+        rewritten.replace_range(middle_offset..middle_offset + middle_old.len(), &middle_new);
+        rewritten.push_str(&filler_line);
+        std::fs::write(&path, &rewritten).unwrap();
+        let after = FileVersion::read(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+        assert!(after.len > before.len);
+
+        // The fixed guard intentionally misses this middle rewrite until the
+        // bounded consistency deadline, so the early lookup still exposes the
+        // cached identity while only reading the append delta.
+        let early = cached_active_subagents_for_path_at("s1", &path, t0 + Duration::from_secs(1));
+        assert_eq!(early.len(), 1);
+        assert_eq!(early[0].id, "agent-old");
+
+        let fresh = cached_active_subagents_for_path_at(
+            "s1",
+            &path,
+            t0 + crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL + Duration::from_secs(1),
+        );
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].id, "agent-new");
+    }
+
+    #[test]
+    fn cached_lookup_reparses_same_inode_shrink_after_partial_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shrink-after-partial.jsonl");
+        let first = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let replacement = first.replace("a1", "b1");
+        std::fs::write(&path, format!("{first}\nold trailing bytes")).unwrap();
+        assert_eq!(cached_active_subagents_for_path("s1", &path)[0].id, "a1");
+
+        // The new length is still at least the previous complete-line offset,
+        // which is why checking `len >= offset` alone is insufficient.
+        std::fs::write(&path, format!("{replacement}\nX")).unwrap();
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id, "b1");
+    }
+
+    #[test]
+    fn cached_lookup_retries_partial_completion_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("partial-completion.jsonl");
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let completion = r#"{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:01:00Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a1","content":"done"}]}}"#;
+        std::fs::write(&path, format!("{assistant}\n")).unwrap();
+        assert_eq!(
+            cached_active_subagents_for_path("s1", &path)[0].status,
+            SubagentStatus::Running
+        );
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{completion}").unwrap();
+        drop(file);
+        assert_eq!(
+            cached_active_subagents_for_path("s1", &path)[0].status,
+            SubagentStatus::Running
+        );
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file).unwrap();
+        drop(file);
+        assert_eq!(
+            cached_active_subagents_for_path("s1", &path)[0].status,
+            SubagentStatus::Completed
+        );
+    }
+
+    #[test]
+    fn subagent_cache_prunes_non_live_running_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale_path = tmp.path().join("stale-running.jsonl");
+        let recent_path = tmp.path().join("recent-completed.jsonl");
+        let now = Utc::now();
+        let completed_at = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let mut cache = HashMap::new();
+        cache.insert(
+            stale_path.clone(),
+            SubagentCacheEntry {
+                stamp: FileVersion {
+                    len: 1,
+                    modified_nanos: 1,
+                    changed_nanos: 1_000_000_001,
+                    identity: 1,
+                },
+                offset: 1,
+                subagents: vec![subagent_info(SubagentStatus::Running, None)],
+                prefix: None,
+                next_full_verify_offset: 0,
+                last_full_validation_at: Instant::now(),
+                last_prefix_validation_bytes: 0,
+                last_access: Instant::now(),
+            },
+        );
+        cache.insert(
+            recent_path.clone(),
+            SubagentCacheEntry {
+                stamp: FileVersion {
+                    len: 2,
+                    modified_nanos: 1,
+                    changed_nanos: 1_000_000_001,
+                    identity: 2,
+                },
+                offset: 2,
+                subagents: vec![subagent_info(
+                    SubagentStatus::Completed,
+                    Some(&completed_at),
+                )],
+                prefix: None,
+                next_full_verify_offset: 0,
+                last_full_validation_at: Instant::now(),
+                last_prefix_validation_bytes: 0,
+                last_access: Instant::now(),
+            },
+        );
+        let seen = HashSet::from([stale_path.clone(), recent_path.clone()]);
+        let live = HashSet::new();
+        prune_subagent_cache(&mut cache, &seen, &live, now);
+        assert!(!cache.contains_key(&stale_path));
+        assert!(cache.contains_key(&recent_path));
+    }
+
+    #[test]
+    fn subagent_cache_evicts_oldest_paths() {
+        let mut cache = HashMap::new();
+        for i in 0..=SUBAGENT_CACHE_MAX_ENTRIES {
+            cache.insert(
+                PathBuf::from(format!("/synthetic/subagent-{i}.jsonl")),
+                SubagentCacheEntry {
+                    stamp: FileVersion {
+                        len: i as u64,
+                        modified_nanos: 1,
+                        changed_nanos: 1_000_000_001,
+                        identity: i as u64 + 1,
+                    },
+                    offset: i as u64,
+                    subagents: Vec::new(),
+                    prefix: None,
+                    next_full_verify_offset: 0,
+                    last_full_validation_at: Instant::now(),
+                    last_prefix_validation_bytes: 0,
+                    last_access: Instant::now()
+                        - std::time::Duration::from_secs(
+                            (SUBAGENT_CACHE_MAX_ENTRIES - i + 1) as u64,
+                        ),
+                },
+            );
+        }
+        evict_oldest_subagent_cache_entries(&mut cache);
+        assert_eq!(cache.len(), SUBAGENT_CACHE_MAX_ENTRIES);
+        assert!(!cache.contains_key(&PathBuf::from("/synthetic/subagent-0.jsonl")));
+    }
+
+    #[test]
+    fn cached_lookup_falls_back_to_full_reparse_when_file_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("replaced.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#),
+        )
+        .unwrap();
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id, "a1");
+
+        // Delete and recreate at the same path with entirely different
+        // content — a different inode, so this must NOT be treated as a
+        // grown/appended version of the old file.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"assistant","uuid":"u9","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m9","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"b1","name":"Agent","input":{"subagent_type":"z","description":"replaced"}}],"stop_reason":null,"stop_sequence":null}}"#),
+        )
+        .unwrap();
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id, "b1");
     }
 
     #[test]
