@@ -767,7 +767,7 @@ mod tests {
         assert_eq!(cache.len(), 1, "cache size unchanged on hit");
     }
 
-    /// Combines `pid_entrypoint_under` + `is_monitored_entrypoint`, mirroring
+    /// Combines `pid_meta_under` + `is_monitored_entrypoint`, mirroring
     /// what `detect()`'s filter_map does per-agent.
     fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
         is_monitored_entrypoint(pid_meta_under(home, pid).entrypoint.as_deref())
