@@ -164,21 +164,32 @@ pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
 ///
 /// `Waiting` means Claude Code itself is showing a prompt, so it always wins.
 /// When `reports_prompts` (the Claude Code version reports every prompt as
-/// `Waiting`), `Busy`/`Idle` also rule out a prompt and override a
-/// NeedsAttention inferred from the transcript. Otherwise CLI activity never
-/// overrides NeedsAttention or Connecting and only refines Working vs
-/// WaitingForInput.
+/// `Waiting`), `Busy`/`Idle` also rule out a prompt: `Busy` overrides any
+/// NeedsAttention inferred from the transcript or hooks, and `Idle` overrides
+/// one that stands for a prompt. A trailing text question (`pending_tool` of
+/// "Question") leaves Claude Code idle, so it stays NeedsAttention while idle.
+/// Otherwise CLI activity never overrides NeedsAttention or Connecting and only
+/// refines Working vs WaitingForInput.
 pub fn merge_cli_activity(
     heuristic: SessionStatus,
     cli: Option<CliActivity>,
     reports_prompts: bool,
-    has_pending_tool: bool,
+    pending_tool: Option<&str>,
 ) -> SessionStatus {
-    let heuristic = match (heuristic, cli) {
+    let text_question = pending_tool == Some("Question");
+    match (&heuristic, cli) {
         (_, Some(CliActivity::Waiting)) => return SessionStatus::NeedsAttention,
-        (SessionStatus::NeedsAttention, Some(_)) if reports_prompts => SessionStatus::Working,
-        (heuristic, _) => heuristic,
-    };
+        (SessionStatus::NeedsAttention, Some(CliActivity::Busy)) if reports_prompts => {
+            return SessionStatus::Working;
+        }
+        (SessionStatus::NeedsAttention, Some(CliActivity::Idle))
+            if reports_prompts && !text_question =>
+        {
+            return SessionStatus::WaitingForInput;
+        }
+        _ => {}
+    }
+    let has_pending_tool = pending_tool.is_some();
     match (heuristic, cli) {
         (SessionStatus::NeedsAttention, _) => SessionStatus::NeedsAttention,
         (SessionStatus::Connecting, _) => SessionStatus::Connecting,
@@ -683,7 +694,7 @@ pub fn enrich_detected_sessions(
             heuristic_status,
             detected.cli_activity,
             detected.cli_reports_prompts,
-            pending_tool_name.is_some(),
+            pending_tool_name.as_deref(),
         );
 
         let latest_message = get_latest_message_from_entries(&entries);
@@ -1212,7 +1223,7 @@ mod merge_tests {
             SessionStatus::NeedsAttention,
             Some(CliActivity::Busy),
             false,
-            false,
+            None,
         );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
@@ -1223,7 +1234,7 @@ mod merge_tests {
             SessionStatus::NeedsAttention,
             Some(CliActivity::Idle),
             false,
-            false,
+            None,
         );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
@@ -1234,7 +1245,7 @@ mod merge_tests {
             SessionStatus::Connecting,
             Some(CliActivity::Busy),
             false,
-            false,
+            None,
         );
         assert_eq!(merged, SessionStatus::Connecting);
     }
@@ -1245,34 +1256,34 @@ mod merge_tests {
             SessionStatus::WaitingForInput,
             Some(CliActivity::Busy),
             false,
-            false,
+            None,
         );
         assert_eq!(merged, SessionStatus::Working);
     }
 
     #[test]
     fn merge_idle_downgrades_working_without_pending_tool() {
-        let merged = merge_cli_activity(
-            SessionStatus::Working,
-            Some(CliActivity::Idle),
-            false,
-            false,
-        );
+        let merged =
+            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false, None);
         assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 
     #[test]
     fn merge_idle_keeps_working_when_pending_tool() {
-        let merged =
-            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false, true);
+        let merged = merge_cli_activity(
+            SessionStatus::Working,
+            Some(CliActivity::Idle),
+            false,
+            Some("Bash"),
+        );
         assert_eq!(merged, SessionStatus::Working);
     }
 
     #[test]
     fn merge_none_returns_heuristic_unchanged() {
-        let merged = merge_cli_activity(SessionStatus::Working, None, false, false);
+        let merged = merge_cli_activity(SessionStatus::Working, None, false, None);
         assert_eq!(merged, SessionStatus::Working);
-        let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, false, true);
+        let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, false, Some("Bash"));
         assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 
@@ -1283,7 +1294,7 @@ mod merge_tests {
             SessionStatus::WaitingForInput,
             SessionStatus::Connecting,
         ] {
-            let merged = merge_cli_activity(heuristic, Some(CliActivity::Waiting), false, false);
+            let merged = merge_cli_activity(heuristic, Some(CliActivity::Waiting), false, None);
             assert_eq!(merged, SessionStatus::NeedsAttention);
         }
     }
@@ -1294,7 +1305,7 @@ mod merge_tests {
             SessionStatus::NeedsAttention,
             Some(CliActivity::Busy),
             true,
-            true,
+            Some("Bash"),
         );
         assert_eq!(merged, SessionStatus::Working);
     }
@@ -1305,15 +1316,48 @@ mod merge_tests {
             SessionStatus::NeedsAttention,
             Some(CliActivity::Idle),
             true,
-            false,
+            None,
         );
         assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 
     #[test]
     fn merge_keeps_needs_attention_without_cli_activity() {
-        let merged = merge_cli_activity(SessionStatus::NeedsAttention, None, true, true);
+        let merged = merge_cli_activity(SessionStatus::NeedsAttention, None, true, Some("Bash"));
         assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_idle_keeps_text_question_needing_attention() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            true,
+            Some("Question"),
+        );
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_busy_clears_text_question() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Busy),
+            true,
+            Some("Question"),
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_idle_clears_inferred_prompt_even_with_pending_tool() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            true,
+            Some("Bash"),
+        );
+        assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 }
 
