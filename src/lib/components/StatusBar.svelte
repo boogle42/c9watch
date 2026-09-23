@@ -185,7 +185,10 @@
 		background: rgba(255, 255, 255, 0.05); /* Slightly darker base */
 		border-radius: 1px;
 		opacity: 1; /* Normal visibility by default */
-		transition: background-color 0.4s, box-shadow 0.4s;
+		/* No box-shadow glow: the staggered color transitions repaint the whole
+		   grid each frame for ~3s, and blurring 100+ shadows per frame dominated
+		   the app's CPU on every status change. */
+		transition: background-color 0.4s;
 		transition-delay: calc(var(--i) * 25ms);
 	}
 
@@ -232,9 +235,9 @@
 		.rect.sweeping::after { animation: none; }
 	}
 
-	.rect.working { background-color: var(--status-working); color: var(--status-working); box-shadow: 0 0 4px var(--status-working-glow); }
-	.rect.permission { background-color: var(--status-permission); color: var(--status-permission); box-shadow: 0 0 4px var(--status-permission-glow); }
-	.rect.input { background-color: var(--status-input); color: var(--status-input); box-shadow: 0 0 4px var(--status-input-glow); }
+	.rect.working { background-color: var(--status-working); color: var(--status-working); }
+	.rect.permission { background-color: var(--status-permission); color: var(--status-permission); }
+	.rect.input { background-color: var(--status-input); color: var(--status-input); }
 
 	.legend {
 		display: flex;

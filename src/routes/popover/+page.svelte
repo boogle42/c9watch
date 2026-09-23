@@ -285,7 +285,10 @@
 		position: relative;
 		background: rgba(255, 255, 255, 0.06);
 		border-radius: 1px;
-		transition: background-color 0.4s, box-shadow 0.4s;
+		/* No box-shadow glow: the staggered color transitions repaint the whole
+		   grid each frame, and blurring every block's shadow per frame
+		   dominated the app's CPU on every status change. */
+		transition: background-color 0.4s;
 		transition-delay: calc(var(--i) * 50ms);
 	}
 
@@ -332,9 +335,9 @@
 		.block.sweeping::after { animation: none; }
 	}
 
-	.block.working    { background-color: var(--status-working);    color: var(--status-working);    box-shadow: 0 0 3px var(--status-working-glow); }
-	.block.permission { background-color: var(--status-permission); color: var(--status-permission); box-shadow: 0 0 3px var(--status-permission-glow); }
-	.block.input      { background-color: var(--status-input);      color: var(--status-input);      box-shadow: 0 0 3px var(--status-input-glow); }
+	.block.working    { background-color: var(--status-working);    color: var(--status-working); }
+	.block.permission { background-color: var(--status-permission); color: var(--status-permission); }
+	.block.input      { background-color: var(--status-input);      color: var(--status-input); }
 
 	.popover-content {
 		flex: 1;
