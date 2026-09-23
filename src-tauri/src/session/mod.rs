@@ -5,6 +5,7 @@ pub mod custom_names;
 pub mod detector;
 pub mod parser;
 pub mod permissions;
+pub mod running_tools;
 pub mod pi;
 pub mod opencode;
 mod pid_check;

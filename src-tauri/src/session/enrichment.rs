@@ -677,11 +677,29 @@ pub fn enrich_detected_sessions(
 
         let latest_message = get_latest_message_from_entries(&entries);
         let notification_preview = notification_preview_from_entries(&entries);
+        // Without hooks, a Bash call that is visibly executing was approved,
+        // whatever the allow rules say (auto mode, a prompt already answered).
+        let bash_running = hook_state.is_none()
+            && pending_tool_name.as_deref() == Some("Bash")
+            && detected.pid != 0
+            && get_pending_tool_input_with(&entries, &checker)
+                .as_ref()
+                .and_then(|input| input["command"].as_str())
+                .is_some_and(|command| {
+                    crate::session::running_tools::bash_command_running(detected.pid, command)
+                });
+        let (status, pending_tool_name) = if bash_running {
+            (SessionStatus::Working, None)
+        } else {
+            (status, pending_tool_name)
+        };
+
         let pending_tool_input = match &hook_prompt {
             Some(prompt) if prompt.agent_id.is_none() => {
                 pending_input_named(&entries, &prompt.tool_name)
             }
             Some(_) => None,
+            None if bash_running => None,
             None => get_pending_tool_input_with(&entries, &checker),
         };
 
