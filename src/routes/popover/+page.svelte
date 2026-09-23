@@ -158,7 +158,7 @@
 	<div class="pixel-grid" class:empty={totalSessions === 0} bind:clientWidth={trackWidth}>
 		<div class="grid-inner" style="grid-template-columns: repeat({columns}, 1fr);">
 			{#each statusArray as status, i}
-				<div class="block {status}" class:sweeping={isSweeping} style="animation-delay: {i * 20}ms; transition-delay: {i * 50}ms"></div>
+				<div class="block {status}" class:sweeping={isSweeping} style="--i: {i}"></div>
 			{/each}
 		</div>
 	</div>
@@ -282,20 +282,54 @@
 	}
 
 	.block {
+		position: relative;
 		background: rgba(255, 255, 255, 0.06);
 		border-radius: 1px;
 		transition: background-color 0.4s, box-shadow 0.4s;
+		transition-delay: calc(var(--i) * 50ms);
 	}
 
-	.block.sweeping {
+	/* Brightness flash as a white overlay's opacity */
+	.block::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		border-radius: inherit;
+		background: #fff;
+		opacity: 0;
+		pointer-events: none;
+	}
+
+	/* Only transform and opacity animate: WebKit composites those without
+	   repainting, whereas filter and the blocks' box-shadow glow repaint every
+	   block on every frame. */
+	.block.sweeping,
+	.block.sweeping:not(.empty)::after {
 		animation: monitor-sweep 2s ease-out forwards;
+		animation-delay: calc(var(--i) * 20ms);
+	}
+
+	.block.sweeping:not(.empty)::after {
+		animation-name: monitor-flash;
 	}
 
 	@keyframes monitor-sweep {
-		0%   { transform: scale(1);    filter: brightness(1); }
-		20%  { transform: scale(0.95); filter: brightness(1.1); }
-		40%  { transform: scale(1.1);  filter: brightness(1.4) drop-shadow(0 0 2px currentColor); }
-		100% { transform: scale(1);    filter: brightness(1); }
+		0%   { transform: scale(1); }
+		20%  { transform: scale(0.95); }
+		40%  { transform: scale(1.1); }
+		100% { transform: scale(1); }
+	}
+
+	@keyframes monitor-flash {
+		0%   { opacity: 0; }
+		20%  { opacity: 0.05; }
+		40%  { opacity: 0.25; }
+		100% { opacity: 0; }
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.block.sweeping,
+		.block.sweeping::after { animation: none; }
 	}
 
 	.block.working    { background-color: var(--status-working);    color: var(--status-working);    box-shadow: 0 0 3px var(--status-working-glow); }

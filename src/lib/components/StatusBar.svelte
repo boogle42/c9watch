@@ -92,7 +92,7 @@
 	<div class="progress-track" class:empty={total === 0} bind:clientWidth={trackWidth}>
 		<div class="grid-container" style="grid-template-columns: repeat({columns}, 1fr);">
 			{#each statusArray as status, i}
-				<div class="rect {status}" class:sweeping={isSweeping} style="animation-delay: {i * 10}ms; transition-delay: {i * 25}ms"></div>
+				<div class="rect {status}" class:sweeping={isSweeping} style="--i: {i}"></div>
 			{/each}
 		</div>
 	</div>
@@ -179,24 +179,57 @@
 
 
 	.rect {
+		position: relative;
 		width: 100%;
 		height: 100%;
 		background: rgba(255, 255, 255, 0.05); /* Slightly darker base */
 		border-radius: 1px;
 		opacity: 1; /* Normal visibility by default */
 		transition: background-color 0.4s, box-shadow 0.4s;
+		transition-delay: calc(var(--i) * 25ms);
 	}
 
-	/* Sweep animation only plays on status change */
-	.rect.sweeping {
+	/* Brightness flash as a white overlay's opacity */
+	.rect::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		border-radius: inherit;
+		background: #fff;
+		opacity: 0;
+		pointer-events: none;
+	}
+
+	/* Sweep animation only plays on status change. Only transform and opacity
+	   animate: WebKit composites those without repainting, whereas filter and
+	   the blocks' box-shadow glow repaint every block on every frame. */
+	.rect.sweeping,
+	.rect.sweeping:not(.empty)::after {
 		animation: monitor-sweep 2s ease-out forwards;
+		animation-delay: calc(var(--i) * 10ms);
+	}
+
+	.rect.sweeping:not(.empty)::after {
+		animation-name: monitor-flash;
 	}
 
 	@keyframes monitor-sweep {
-		0% { transform: scale(1); filter: brightness(1); }
-		20% { transform: scale(0.95); filter: brightness(1.1); }
-		40% { transform: scale(1.1); filter: brightness(1.4) drop-shadow(0 0 2px currentColor); }
-		100% { transform: scale(1); filter: brightness(1); }
+		0% { transform: scale(1); }
+		20% { transform: scale(0.95); }
+		40% { transform: scale(1.1); }
+		100% { transform: scale(1); }
+	}
+
+	@keyframes monitor-flash {
+		0% { opacity: 0; }
+		20% { opacity: 0.05; }
+		40% { opacity: 0.25; }
+		100% { opacity: 0; }
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.rect.sweeping,
+		.rect.sweeping::after { animation: none; }
 	}
 
 	.rect.working { background-color: var(--status-working); color: var(--status-working); box-shadow: 0 0 4px var(--status-working-glow); }
