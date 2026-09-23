@@ -10,6 +10,13 @@ With hooks enabled, Claude Code tells c9watch when it shows a permission prompt,
 so a card shows **Needs Attention** only for a real prompt (or a question from
 Claude).
 
+Independently of hooks, Claude Code reports each session's state in
+`claude agents --json`. A session reported as `waiting` (a permission prompt,
+dialog or other input request) always shows **Needs Attention**. From Claude
+Code 2.1.212, which reports every such prompt as `waiting`, a session reported
+as `busy` or `idle` never shows **Needs Attention** from the transcript
+inference or hook data alone.
+
 ## Enable
 
 From a stable installed executable:

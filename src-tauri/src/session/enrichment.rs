@@ -162,13 +162,23 @@ pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
 
 /// Combines the existing heuristic-based SessionStatus with the CLI activity signal.
 ///
-/// CLI activity NEVER overrides NeedsAttention or Connecting — those stay driven by
-/// JSONL content + PermissionChecker. It only refines Working vs WaitingForInput.
+/// `Waiting` means Claude Code itself is showing a prompt, so it always wins.
+/// When `reports_prompts` (the Claude Code version reports every prompt as
+/// `Waiting`), `Busy`/`Idle` also rule out a prompt and override a
+/// NeedsAttention inferred from the transcript. Otherwise CLI activity never
+/// overrides NeedsAttention or Connecting and only refines Working vs
+/// WaitingForInput.
 pub fn merge_cli_activity(
     heuristic: SessionStatus,
     cli: Option<CliActivity>,
+    reports_prompts: bool,
     has_pending_tool: bool,
 ) -> SessionStatus {
+    let heuristic = match (heuristic, cli) {
+        (_, Some(CliActivity::Waiting)) => return SessionStatus::NeedsAttention,
+        (SessionStatus::NeedsAttention, Some(_)) if reports_prompts => SessionStatus::Working,
+        (heuristic, _) => heuristic,
+    };
     match (heuristic, cli) {
         (SessionStatus::NeedsAttention, _) => SessionStatus::NeedsAttention,
         (SessionStatus::Connecting, _) => SessionStatus::Connecting,
@@ -672,6 +682,7 @@ pub fn enrich_detected_sessions(
         let status = merge_cli_activity(
             heuristic_status,
             detected.cli_activity,
+            detected.cli_reports_prompts,
             pending_tool_name.is_some(),
         );
 
@@ -1201,6 +1212,7 @@ mod merge_tests {
             SessionStatus::NeedsAttention,
             Some(CliActivity::Busy),
             false,
+            false,
         );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
@@ -1211,13 +1223,19 @@ mod merge_tests {
             SessionStatus::NeedsAttention,
             Some(CliActivity::Idle),
             false,
+            false,
         );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
 
     #[test]
     fn merge_preserves_connecting() {
-        let merged = merge_cli_activity(SessionStatus::Connecting, Some(CliActivity::Busy), false);
+        let merged = merge_cli_activity(
+            SessionStatus::Connecting,
+            Some(CliActivity::Busy),
+            false,
+            false,
+        );
         assert_eq!(merged, SessionStatus::Connecting);
     }
 
@@ -1227,28 +1245,75 @@ mod merge_tests {
             SessionStatus::WaitingForInput,
             Some(CliActivity::Busy),
             false,
+            false,
         );
         assert_eq!(merged, SessionStatus::Working);
     }
 
     #[test]
     fn merge_idle_downgrades_working_without_pending_tool() {
-        let merged = merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false);
+        let merged = merge_cli_activity(
+            SessionStatus::Working,
+            Some(CliActivity::Idle),
+            false,
+            false,
+        );
         assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 
     #[test]
     fn merge_idle_keeps_working_when_pending_tool() {
-        let merged = merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), true);
+        let merged =
+            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false, true);
         assert_eq!(merged, SessionStatus::Working);
     }
 
     #[test]
     fn merge_none_returns_heuristic_unchanged() {
-        let merged = merge_cli_activity(SessionStatus::Working, None, false);
+        let merged = merge_cli_activity(SessionStatus::Working, None, false, false);
         assert_eq!(merged, SessionStatus::Working);
-        let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, true);
+        let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, false, true);
         assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn merge_waiting_always_needs_attention() {
+        for heuristic in [
+            SessionStatus::Working,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Connecting,
+        ] {
+            let merged = merge_cli_activity(heuristic, Some(CliActivity::Waiting), false, false);
+            assert_eq!(merged, SessionStatus::NeedsAttention);
+        }
+    }
+
+    #[test]
+    fn merge_busy_clears_inferred_needs_attention_when_prompts_reported() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Busy),
+            true,
+            true,
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_idle_clears_inferred_needs_attention_when_prompts_reported() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            true,
+            false,
+        );
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn merge_keeps_needs_attention_without_cli_activity() {
+        let merged = merge_cli_activity(SessionStatus::NeedsAttention, None, true, true);
+        assert_eq!(merged, SessionStatus::NeedsAttention);
     }
 }
 
@@ -1277,6 +1342,7 @@ mod placeholder_tests {
             started_at_ms: Some(1_700_000_000_000),
             official_name: None,
             cli_activity: None,
+            cli_reports_prompts: false,
             provider: SessionProvider::ClaudeCode,
             surface: SessionSurface::ClaudeCode,
             agent_kind: AgentKind::Root,
