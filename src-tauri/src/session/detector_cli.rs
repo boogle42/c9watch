@@ -124,10 +124,23 @@ impl CliSessionSource {
     /// `AGENTS_CACHE_MAX_AGE`. Each spawn costs ~0.2s of CPU, so running it on
     /// every poll dominated c9watch's energy use.
     fn agents(&mut self) -> Result<Vec<CliAgent>, SessionDetectorError> {
-        let signature = dirs::home_dir().and_then(|home| registry_signature(&sessions_dir(&home)));
-        if let Some(cache) = &self.agents_cache {
-            if cache_is_fresh(cache, signature.as_ref(), Instant::now()) {
+        let dir = dirs::home_dir().map(|home| sessions_dir(&home));
+        let signature = dir.as_deref().and_then(registry_signature);
+        if let Some(cache) = &mut self.agents_cache {
+            let now = Instant::now();
+            if cache_is_fresh(cache, signature.as_ref(), now) {
                 return Ok(cache.agents.clone());
+            }
+            // Claude Code rewrites a session's file on every status change. When
+            // only existing files changed, apply their new status in place
+            // rather than spawning the command.
+            if let (Some(dir), Some(signature)) = (&dir, &signature) {
+                if now.saturating_duration_since(cache.fetched_at) < AGENTS_CACHE_MAX_AGE
+                    && refresh_changed_rows(dir, &mut cache.agents, &cache.signature, signature)
+                {
+                    cache.signature = signature.clone();
+                    return Ok(cache.agents.clone());
+                }
             }
         }
         self.agents_cache = None;
@@ -254,6 +267,43 @@ fn registry_signature(dir: &Path) -> Option<RegistrySignature> {
         .collect();
     signature.sort();
     Some(signature)
+}
+
+/// Updates `status` and `name` of cached rows from registry files that changed
+/// between `old` and `new`. Returns false, leaving `agents` possibly partially
+/// updated, when the change needs a full `claude agents --json` run instead:
+/// files were added or removed, a changed file is unreadable, it belongs to no
+/// cached row, or a field other than `status`/`name` differs.
+fn refresh_changed_rows(
+    dir: &Path,
+    agents: &mut [CliAgent],
+    old: &RegistrySignature,
+    new: &RegistrySignature,
+) -> bool {
+    if old.len() != new.len() || old.iter().zip(new).any(|(a, b)| a.0 != b.0) {
+        return false;
+    }
+    for (_, entry) in old.iter().zip(new).filter(|(a, b)| a != b) {
+        let Some(row) = std::fs::read_to_string(dir.join(&entry.0))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<CliAgent>(&raw).ok())
+        else {
+            return false;
+        };
+        let Some(agent) = agents.iter_mut().find(|a| a.pid == row.pid) else {
+            return false;
+        };
+        if agent.session_id != row.session_id
+            || agent.cwd != row.cwd
+            || agent.kind != row.kind
+            || agent.started_at != row.started_at
+        {
+            return false;
+        }
+        agent.status = row.status;
+        agent.name = row.name;
+    }
+    true
 }
 
 fn cache_is_fresh(
@@ -576,6 +626,82 @@ mod tests {
         std::fs::write(tmp.path().join("20.json"), "{}").unwrap();
         let changed = registry_signature(tmp.path()).unwrap();
         assert!(!cache_is_fresh(&cache, Some(&changed), fetched_at));
+    }
+
+    /// Writes a registry file for one of `full_schema_json`'s rows and bumps its
+    /// mtime so the signature changes even within one timestamp tick.
+    fn write_registry_row(dir: &Path, pid: u32, body: &str, bump_secs: u64) {
+        let file = dir.join(format!("{pid}.json"));
+        std::fs::write(&file, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(bump_secs))
+            .unwrap();
+    }
+
+    const ROW_A_IDLE: &str = r#"{"pid":1,"cwd":"/tmp/a","kind":"interactive","startedAt":100,"sessionId":"sid-a","status":"idle","entrypoint":"cli"}"#;
+    const ROW_B_IDLE: &str = r#"{"pid":2,"cwd":"/tmp/b","kind":"background","startedAt":200,"sessionId":"sid-b","name":"my-bg","status":"idle"}"#;
+
+    #[test]
+    fn refresh_changed_rows_applies_status_and_name_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_registry_row(tmp.path(), 1, ROW_A_IDLE, 0);
+        write_registry_row(tmp.path(), 2, ROW_B_IDLE, 0);
+        let old = registry_signature(tmp.path()).unwrap();
+        let mut agents = parse_cli_agents(full_schema_json().as_bytes()).unwrap();
+
+        write_registry_row(
+            tmp.path(),
+            1,
+            &ROW_A_IDLE.replace(r#""status":"idle""#, r#""status":"waiting","name":"renamed""#),
+            5,
+        );
+        let new = registry_signature(tmp.path()).unwrap();
+
+        assert!(refresh_changed_rows(tmp.path(), &mut agents, &old, &new));
+        assert_eq!(agents[0].status.as_deref(), Some("waiting"));
+        assert_eq!(agents[0].name.as_deref(), Some("renamed"));
+        // Unchanged file: row untouched even though it disagrees with the cache.
+        assert_eq!(agents[1].status.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn refresh_changed_rows_needs_spawn_for_added_or_removed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_registry_row(tmp.path(), 1, ROW_A_IDLE, 0);
+        let old = registry_signature(tmp.path()).unwrap();
+        let mut agents = parse_cli_agents(full_schema_json().as_bytes()).unwrap();
+
+        write_registry_row(tmp.path(), 2, ROW_B_IDLE, 0);
+        let added = registry_signature(tmp.path()).unwrap();
+        assert!(!refresh_changed_rows(tmp.path(), &mut agents, &old, &added));
+        assert!(!refresh_changed_rows(tmp.path(), &mut agents, &added, &old));
+    }
+
+    #[test]
+    fn refresh_changed_rows_needs_spawn_for_unknown_pid_identity_change_or_bad_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_registry_row(tmp.path(), 1, ROW_A_IDLE, 0);
+        let old = registry_signature(tmp.path()).unwrap();
+
+        let cases = [
+            ROW_A_IDLE.replace(r#""pid":1"#, r#""pid":9"#),
+            ROW_A_IDLE.replace("/tmp/a", "/tmp/moved"),
+            ROW_A_IDLE.replace("sid-a", "sid-new"),
+            ROW_A_IDLE.replace(r#""startedAt":100"#, r#""startedAt":101"#),
+            "not json".to_string(),
+        ];
+        for (i, body) in cases.iter().enumerate() {
+            let mut agents = parse_cli_agents(full_schema_json().as_bytes()).unwrap();
+            write_registry_row(tmp.path(), 1, body, 5 + i as u64);
+            let new = registry_signature(tmp.path()).unwrap();
+            assert!(
+                !refresh_changed_rows(tmp.path(), &mut agents, &old, &new),
+                "case {i} should need a spawn"
+            );
+        }
     }
 
     #[test]
