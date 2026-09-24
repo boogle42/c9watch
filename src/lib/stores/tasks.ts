@@ -24,7 +24,9 @@ function normalizeStatus(s: unknown): TaskStatus {
 }
 
 async function refreshOnce() {
-	if (!isTauri()) return;
+	// Hidden windows skip the backstop poll; the sessions store change applied
+	// on becoming visible triggers a fresh read.
+	if (!isTauri() || document.hidden) return;
 	// TodoWrite tasks are a Claude Code namespace. Do not query or cache them
 	// for Codex/Cursor sessions whose opaque IDs may collide with Claude IDs.
 	const ids = get(sessions)
