@@ -29,7 +29,7 @@
 			isSweeping = true;
 			setTimeout(() => {
 				isSweeping = false;
-			}, 6000); // 6s duration to cover ripple delay across all blocks
+			}, 2000);
 		}
 		prevSummaryKey = currentKey;
 	});
@@ -90,9 +90,9 @@
 <div class="system-status-bar">
 
 	<div class="progress-track" class:empty={total === 0} bind:clientWidth={trackWidth}>
-		<div class="grid-container" style="grid-template-columns: repeat({columns}, 1fr);">
-			{#each statusArray as status, i}
-				<div class="rect {status}" class:sweeping={isSweeping} style="--i: {i}"></div>
+		<div class="grid-container" class:sweeping={isSweeping} style="grid-template-columns: repeat({columns}, 1fr);">
+			{#each statusArray as status}
+				<div class="rect {status}"></div>
 			{/each}
 		</div>
 	</div>
@@ -170,6 +170,7 @@
 	}
 
 	.grid-container {
+		position: relative;
 		display: grid;
 		grid-template-rows: 1fr;
 		gap: 2px;
@@ -179,47 +180,41 @@
 
 
 	.rect {
-		position: relative;
 		width: 100%;
 		height: 100%;
 		background: rgba(255, 255, 255, 0.05); /* Slightly darker base */
 		border-radius: 1px;
 		opacity: 1; /* Normal visibility by default */
-		/* No box-shadow glow: the staggered color transitions repaint the whole
-		   grid each frame for ~3s, and blurring 100+ shadows per frame dominated
-		   the app's CPU on every status change. */
+		/* Every block changes color at once, with no per-block delay or glow: a
+		   staggered ripple across 100+ blocks keeps WebKit restyling and
+		   repainting the grid on every frame for seconds after each change. */
 		transition: background-color 0.4s;
-		transition-delay: calc(var(--i) * 25ms);
 	}
 
 	/* Brightness flash as a white overlay's opacity */
-	.rect::after {
+	.grid-container::after {
 		content: '';
 		position: absolute;
 		inset: 0;
-		border-radius: inherit;
 		background: #fff;
 		opacity: 0;
 		pointer-events: none;
 	}
 
-	/* Sweep animation only plays on status change. Only transform and opacity
-	   animate: WebKit composites those without repainting, whereas filter and
-	   the blocks' box-shadow glow repaint every block on every frame. */
-	.rect.sweeping,
-	.rect.sweeping:not(.empty)::after {
+	/* The sweep plays once on the whole bar, animating only transform and
+	   opacity, which WebKit composites without repainting. */
+	.grid-container.sweeping {
 		animation: monitor-sweep 2s ease-out forwards;
-		animation-delay: calc(var(--i) * 10ms);
 	}
 
-	.rect.sweeping:not(.empty)::after {
-		animation-name: monitor-flash;
+	.grid-container.sweeping::after {
+		animation: monitor-flash 2s ease-out forwards;
 	}
 
 	@keyframes monitor-sweep {
 		0% { transform: scale(1); }
-		20% { transform: scale(0.95); }
-		40% { transform: scale(1.1); }
+		20% { transform: scale(0.99); }
+		40% { transform: scale(1.01); }
 		100% { transform: scale(1); }
 	}
 
@@ -231,8 +226,8 @@
 	}
 
 	@media (prefers-reduced-motion: reduce) {
-		.rect.sweeping,
-		.rect.sweeping::after { animation: none; }
+		.grid-container.sweeping,
+		.grid-container.sweeping::after { animation: none; }
 	}
 
 	.rect.working { background-color: var(--status-working); color: var(--status-working); }
