@@ -38,7 +38,7 @@ fn default_kind() -> String {
 /// Longest a cached `claude agents --json` result is reused while the session
 /// registry looks unchanged. Bounds staleness for anything the command reports
 /// that doesn't touch `~/.claude/sessions/`.
-const AGENTS_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
+const AGENTS_CACHE_MAX_AGE: Duration = Duration::from_secs(120);
 
 /// Name, mtime and size of each `*.json` file in `~/.claude/sessions/`,
 /// sorted by name. Claude Code rewrites a session's file on start, exit and
