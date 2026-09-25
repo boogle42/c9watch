@@ -721,7 +721,10 @@ mod tests {
         write_registry_row(
             tmp.path(),
             1,
-            &ROW_A_IDLE.replace(r#""status":"idle""#, r#""status":"waiting","name":"renamed""#),
+            &ROW_A_IDLE.replace(
+                r#""status":"idle""#,
+                r#""status":"waiting","name":"renamed""#,
+            ),
             5,
         );
         let new = registry_signature(tmp.path()).unwrap();
