@@ -351,18 +351,13 @@ impl LegacySessionSource {
                 continue;
             }
 
-            // Check process name first (works for direct installs)
-            let name_match = name.contains("claude");
+            let cmd: Vec<String> = process
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
 
-            // Also check command-line args (handles npm-installed Claude Code
-            // where process.name() returns "node")
-            let cmd_match = !name_match
-                && process.cmd().iter().any(|arg| {
-                    let a = arg.to_string_lossy();
-                    a.contains("claude") && !a.contains("c9watch")
-                });
-
-            if name_match || cmd_match {
+            if is_claude_code_process(&name, process.exe(), &cmd) {
                 let cwd = process.cwd().map(|p| p.to_path_buf());
                 let start_time = process.start_time();
 
@@ -422,6 +417,58 @@ impl SessionSource for LegacySessionSource {
 
 /// Encodes a path the same way Claude Code does for its project directory names:
 /// every non-alphanumeric character is replaced with a dash.
+/// Whether a process is a Claude Code CLI: the `claude` executable itself
+/// (native installer, Homebrew or an npm shim), or a Node/Bun runtime executing
+/// the Claude Code package.
+///
+/// Matches whole program names rather than any `claude` substring in the
+/// command line: Claude Desktop's helper processes carry arguments like
+/// `--standard-schemes=claude-media`, and each one would otherwise be paired
+/// with an unrelated recent transcript.
+fn is_claude_code_process(name: &str, exe: Option<&Path>, cmd: &[String]) -> bool {
+    let is_claude_name = |n: &str| n == "claude" || n == "claude.exe";
+    let base = |s: &str| {
+        Path::new(s)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+
+    let argv0 = cmd.first().map(|a| base(a)).unwrap_or_default();
+    if is_claude_name(name) || is_claude_name(&argv0) {
+        return true;
+    }
+    if let Some(exe) = exe {
+        let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
+        if is_claude_name(&exe_name) {
+            return true;
+        }
+        // Native installer: `~/.local/bin/claude` symlinks to
+        // `~/.local/share/claude/versions/<version>`, so the resolved exe is
+        // named after the version.
+        let parent = exe.parent();
+        if parent
+            .and_then(Path::file_name)
+            .is_some_and(|d| d == "versions")
+            && parent
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .is_some_and(|d| d == "claude")
+        {
+            return true;
+        }
+    }
+
+    let is_runtime = ["node", "node.exe", "bun", "bun.exe"]
+        .iter()
+        .any(|r| name == *r || argv0 == *r);
+    is_runtime
+        && cmd.iter().skip(1).any(|arg| {
+            is_claude_name(&base(arg))
+                || arg.replace('\\', "/").contains("@anthropic-ai/claude-code")
+        })
+}
+
 pub(crate) fn encode_path_for_matching(path: &str) -> String {
     path.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -488,6 +535,74 @@ mod tests {
         let processes = detector.find_claude_processes();
         // This test will vary based on whether claude is running
         println!("Found {} claude processes", processes.len());
+    }
+
+    fn cmd(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn matches_native_install_by_name_argv0_or_versioned_exe() {
+        assert!(is_claude_code_process("claude", None, &cmd(&["claude"])));
+        assert!(is_claude_code_process(
+            "2.1.283",
+            Some(Path::new("/Users/u/.local/share/claude/versions/2.1.283")),
+            &cmd(&["/Users/u/.local/bin/claude", "-p"])
+        ));
+        assert!(is_claude_code_process(
+            "2.1.283",
+            Some(Path::new("/Users/u/.local/share/claude/versions/2.1.283")),
+            &cmd(&[])
+        ));
+        assert!(is_claude_code_process("claude.exe", None, &cmd(&[])));
+    }
+
+    #[test]
+    fn matches_npm_install_run_by_node() {
+        assert!(is_claude_code_process(
+            "node",
+            Some(Path::new("/opt/homebrew/bin/node")),
+            &cmd(&["node", "/opt/homebrew/bin/claude", "--resume"])
+        ));
+        assert!(is_claude_code_process(
+            "node",
+            None,
+            &cmd(&[
+                "node",
+                "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+            ])
+        ));
+    }
+
+    #[test]
+    fn rejects_claude_desktop_helpers_and_other_claude_substrings() {
+        assert!(!is_claude_code_process(
+            "Claude Helper",
+            Some(Path::new(
+                "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"
+            )),
+            &cmd(&[
+                "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",
+                "--type=utility",
+                "--standard-schemes=cowork-artifact,claude-media",
+            ])
+        ));
+        assert!(!is_claude_code_process(
+            "Claude",
+            None,
+            &cmd(&["/Applications/Claude.app/Contents/MacOS/Claude"])
+        ));
+        assert!(!is_claude_code_process("ClaudeBar", None, &cmd(&[])));
+        assert!(!is_claude_code_process(
+            "bash",
+            None,
+            &cmd(&["bash", "/Users/u/.claude/scripts/statusline-command.sh"])
+        ));
+        assert!(!is_claude_code_process(
+            "node",
+            None,
+            &cmd(&["node", "/Users/u/claude-tools/server.js"])
+        ));
     }
 
     #[test]
