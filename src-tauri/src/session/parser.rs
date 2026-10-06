@@ -102,6 +102,8 @@ pub struct UserMessage {
     pub is_tool_result: bool,
     /// Base64-encoded images attached to this message
     pub images: Vec<ImageBlock>,
+    /// `tool_use_id`s of the tool_result blocks in this entry
+    pub tool_result_ids: Vec<String>,
 }
 
 impl<'de> Deserialize<'de> for UserMessage {
@@ -121,6 +123,7 @@ impl<'de> Deserialize<'de> for UserMessage {
         let content_value = value.get("content");
 
         let mut images = Vec::new();
+        let mut tool_result_ids = Vec::new();
         let (content, is_tool_result) = match content_value {
             Some(Value::String(s)) => (s.clone(), false),
             Some(Value::Array(arr)) => {
@@ -130,6 +133,9 @@ impl<'de> Deserialize<'de> for UserMessage {
                     match item.get("type").and_then(|t| t.as_str()) {
                         Some("tool_result") => {
                             has_tool_result = true;
+                            if let Some(id) = item.get("tool_use_id").and_then(|v| v.as_str()) {
+                                tool_result_ids.push(id.to_string());
+                            }
                             if let Some(content) = item.get("content") {
                                 match content {
                                     Value::String(s) => parts.push(s.clone()),
@@ -186,6 +192,7 @@ impl<'de> Deserialize<'de> for UserMessage {
             content,
             is_tool_result,
             images,
+            tool_result_ids,
         })
     }
 }
@@ -943,6 +950,7 @@ mod tests {
                 content: "Hello Claude".to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
@@ -961,6 +969,7 @@ mod tests {
                 content: "tool output here".to_string(),
                 is_tool_result: true,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
@@ -1123,6 +1132,7 @@ mod tests {
                     content: "hi".to_string(),
                     is_tool_result: false,
                     images: vec![],
+                    tool_result_ids: vec![],
                 },
             },
             SessionEntry::Unknown,
@@ -1261,6 +1271,7 @@ mod tests {
                     .to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
@@ -1278,6 +1289,7 @@ mod tests {
                 content: "<local-command-caveat>Caveat: DO NOT respond to these messages.</local-command-caveat>".to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
@@ -1294,6 +1306,7 @@ mod tests {
                 content: "<command-name>/exit</command-name>\n<command-message>exit</command-message>\n<command-args></command-args>".to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
