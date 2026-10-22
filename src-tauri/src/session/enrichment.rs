@@ -152,14 +152,8 @@ fn claude_custom_title(
         .flatten()
 }
 
-/// Look up the native custom title for a session JSONL, using a strong file
-/// stamp when the platform provides one and a safe re-scan otherwise.
-pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
-    get_cached_native_titles(path).custom
-}
-
-/// Look up both native titles for a session JSONL, cached like
-/// [`get_cached_native_title`].
+/// Look up the native custom and AI titles for a session JSONL, using a strong
+/// file stamp when the platform provides one and a safe re-scan otherwise.
 pub(crate) fn get_cached_native_titles(path: &Path) -> NativeTitles {
     get_cached_native_titles_with(
         path,
@@ -1944,7 +1938,10 @@ mod placeholder_tests {
             }),
             NativeTitles::default()
         );
-        assert_eq!(get_cached_native_title(&path).as_deref(), Some("recovered"));
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("recovered")
+        );
     }
 
     #[test]
@@ -1959,8 +1956,14 @@ mod placeholder_tests {
         .unwrap();
         drop(file);
 
-        assert_eq!(get_cached_native_title(&path).as_deref(), Some("first"));
-        assert_eq!(get_cached_native_title(&path).as_deref(), Some("first"));
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("first")
+        );
 
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -1973,9 +1976,12 @@ mod placeholder_tests {
         .unwrap();
         drop(file);
 
-        assert_eq!(get_cached_native_title(&path).as_deref(), Some("second"));
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("second")
+        );
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(get_cached_native_title(&path), None);
+        assert_eq!(get_cached_native_titles(&path), NativeTitles::default());
     }
 
     #[test]

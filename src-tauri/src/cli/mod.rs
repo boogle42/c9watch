@@ -1613,6 +1613,11 @@ fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
             .unwrap()
             .insert("cursorTitle".to_string(), serde_json::json!(title));
     }
+    if let Some(title) = entry.ai_title {
+        json.as_object_mut()
+            .unwrap()
+            .insert("aiTitle".to_string(), serde_json::json!(title));
+    }
 
     json
 }

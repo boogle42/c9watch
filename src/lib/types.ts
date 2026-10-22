@@ -244,6 +244,8 @@ export interface HistoryEntry {
   codexTitle?: string | null;
   /** Current Cursor UI composer name from state.vscdb. */
   cursorTitle?: string | null;
+  /** Claude Code's auto-generated title (`ai-title` in the session JSONL). */
+  aiTitle?: string | null;
   provider?: SessionProvider;
   surface?: SessionSurface;
 }
