@@ -1554,6 +1554,9 @@ fn insert_session_contract(json: &mut serde_json::Value, session: &session::enri
     if let Some(title) = &session.cursor_title {
         object.insert("cursorTitle".to_string(), serde_json::json!(title));
     }
+    if let Some(title) = &session.ai_title {
+        object.insert("aiTitle".to_string(), serde_json::json!(title));
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -2074,6 +2077,7 @@ mod session_formatter_tests {
             custom_title: None,
             codex_title: Some("Codex thread title".to_string()),
             cursor_title: None,
+            ai_title: None,
             project_path: "/tmp/project".to_string(),
             git_branch: None,
             first_prompt: "investigate".to_string(),
